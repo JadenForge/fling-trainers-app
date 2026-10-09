@@ -1,0 +1,64 @@
+{
+  "name": "fling-trainers-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "风灵月影修改器合集 —— 支持 macOS / Windows 的桌面客户端",
+  "main": "src/main.js",
+  "type": "module",
+  "author": "",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "build:data": "node scripts/build-data.mjs",
+    "build:data:force": "node scripts/build-data.mjs --force",
+    "smoke": "bash scripts/run-local.sh --smoke",
+    "verify": "bash scripts/run-local.sh --verify",
+    "soak": "bash scripts/run-local.sh --soak",
+    "dist": "electron-builder",
+    "dist:mac": "electron-builder --mac",
+    "dist:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.fling.trainers.collection",
+    "productName": "风灵月影修改器合集",
+    "directories": {
+      "output": "release",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "data/**/*",
+      "scripts/**/*",
+      "package.json"
+    ],
+    "asarUnpack": [
+      "scripts/**"
+    ],
+    "extraMetadata": {
+      "main": "src/main.js"
+    },
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        { "target": "dmg", "arch": ["x64", "arm64"] },
+        { "target": "zip", "arch": ["x64", "arm64"] }
+      ]
+    },
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  }
+}

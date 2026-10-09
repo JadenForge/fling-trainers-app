@@ -1,0 +1,18 @@
+# 依赖
+node_modules/
+
+# 打包产物
+release/
+dist/
+
+# Electron 本地缓存（手动下载 electron 时产生）
+.electron-cache/
+
+# 自检截图与验证报告
+# 注意：build/ 同时是 electron-builder 的 buildResources 目录，
+# 如需放置图标等打包资源，请用 !build/icon.* 等规则显式排除
+build/
+
+# 系统与日志
+.DS_Store
+*.log
