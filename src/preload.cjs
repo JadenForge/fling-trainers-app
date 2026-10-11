@@ -27,6 +27,7 @@ contextBridge.exposeInMainWorld('api', {
   // 运行
   launch: (payload) => ipcRenderer.invoke('launch:trainer', payload),
   launchPickFile: (payload) => ipcRenderer.invoke('launch:pickFile', payload),
+  stopTrainer: (payload) => ipcRenderer.invoke('launch:stop', payload),
 
   // 封面与系统
   coverEnsure: (payload) => ipcRenderer.invoke('cover:ensure', payload),

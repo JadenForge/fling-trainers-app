@@ -12,6 +12,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
+import { detectFileKind, extractZip, findExecutable, findTrainerBinary } from './trainer-files.js';
+import { createTrainerLaunchGuard } from './trainer-launch-guard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(__dirname, '..');
@@ -19,7 +21,12 @@ const UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 const isDev = process.argv.includes('--dev');
+const testMode = ['--verify', '--smoke', '--trainer-smoke'].find((flag) => process.argv.includes(flag));
+if (testMode) {
+  app.setPath('userData', path.join(os.tmpdir(), `fling-trainers-app-${testMode.slice(2)}-${process.pid}`));
+}
 let mainWindow = null;
+let trainerLaunchGuard = null;
 
 /* ------------------------------------------------------------------ */
 /* 日志与崩溃诊断                                                       */
@@ -76,6 +83,7 @@ const DEFAULT_SETTINGS = {
 const EMPTY_STATE = () => ({
   favorites: [],
   downloads: {}, // slug -> { file, name, size, at, ext }
+  activeTrainers: {}, // slug -> { pid, file, name, at }
   recent: [], // slug 数组，最近运行
   hidden: [], // slug 数组，被删除隐藏
   settings: { ...DEFAULT_SETTINGS },
@@ -186,6 +194,98 @@ function createWindow() {
 
   if (isDev) mainWindow.webContents.openDevTools({ mode: 'detach' });
 
+  if (process.argv.includes('--trainer-smoke')) {
+    mainWindow.webContents.once('did-finish-load', async () => {
+      const games = ['wukong', 'hogwarts legacy'];
+      const results = [];
+      for (const en of games) {
+        try {
+          const result = await mainWindow.webContents.executeJavaScript(`(async () => {
+            const loaded = await window.api.getData();
+            const trainer = loaded.trainers.find((item) => item.en.toLowerCase().includes(${JSON.stringify(en)}));
+            if (!trainer) return { ok: false, query: ${JSON.stringify(en)}, count: loaded.trainers.length, error: '数据记录不存在' };
+            const pick = trainer.downloads && trainer.downloads[0];
+            if (!pick) return { ok: false, game: trainer.en, error: '没有下载地址' };
+            const slug = trainer.url.replace(/\\/$/, '').split('/').pop();
+            const download = await window.api.downloadStart({ slug, dlUrl: pick.url, referer: trainer.url, fallbackName: trainer.cn || slug });
+            if (!download.ok) return { ok: false, game: trainer.en, download };
+            const state = await window.api.getState();
+            const record = state.state.downloads[slug] || {};
+            const launch = await window.api.launch({ slug, cn: trainer.cn, en: trainer.en });
+            return {
+              ok: Boolean(record.executable && ((launch.ok && launch.pid) || launch.alreadyRunning)),
+              game: trainer.en,
+              file: download.file,
+              executable: record.executable || '',
+              launch,
+              extractionError: record.extractionError || '',
+            };
+          })()`, true);
+          results.push(result);
+          logLine('[trainer-smoke]', JSON.stringify(result));
+        } catch (error) {
+          const result = { ok: false, game: en, error: String(error.message || error) };
+          results.push(result);
+          logLine('[trainer-smoke]', JSON.stringify(result));
+        }
+      }
+      const reportFile = path.join(ROOT, 'build', 'trainer-smoke-report.json');
+      fs.mkdirSync(path.dirname(reportFile), { recursive: true });
+      fs.writeFileSync(reportFile, JSON.stringify({ results }, null, 2), 'utf8');
+      const failed = results.some((result) => !result.ok);
+      logLine('[trainer-smoke] 完成', `${results.length - results.filter((result) => !result.ok).length}/${results.length}`);
+      app.exit(failed ? 1 : 0);
+    });
+  }
+
+  if (process.argv.includes('--install-current-trainers')) {
+    mainWindow.webContents.once('did-finish-load', async () => {
+      const queries = ['wukong', 'hogwarts legacy'];
+      const results = [];
+      for (const query of queries) {
+        try {
+          const result = await mainWindow.webContents.executeJavaScript(`(async () => {
+            const data = await window.api.getData();
+            const trainer = data.trainers.find((item) => item.en.toLowerCase().includes(${JSON.stringify(query)}));
+            if (!trainer) return { ok: false, query: ${JSON.stringify(query)}, error: '数据记录不存在' };
+            const slug = trainer.url.replace(/\\/$/, '').split('/').pop();
+            let state = await window.api.getState();
+            let record = state.state.downloads[slug];
+            if (!record || !record.executable || !record.file) {
+              const pick = trainer.downloads && trainer.downloads[0];
+              if (!pick) return { ok: false, game: trainer.en, error: '没有下载地址' };
+              const download = await window.api.downloadStart({ slug, dlUrl: pick.url, referer: trainer.url, fallbackName: trainer.cn || slug });
+              if (!download.ok) return { ok: false, game: trainer.en, download };
+              state = await window.api.getState();
+              record = state.state.downloads[slug];
+            }
+            const favorites = [...new Set([slug, ...state.state.favorites])];
+            await window.api.setState({ favorites });
+            return {
+              ok: Boolean(record && record.executable && favorites.includes(slug)),
+              game: trainer.en,
+              file: record?.file || '',
+              executable: record?.executable || '',
+              favorite: favorites.includes(slug),
+            };
+          })()`, true);
+          results.push(result);
+          logLine('[install-current-trainers]', JSON.stringify(result));
+        } catch (error) {
+          const result = { ok: false, query, error: String(error.message || error) };
+          results.push(result);
+          logLine('[install-current-trainers]', JSON.stringify(result));
+        }
+      }
+      const reportFile = path.join(ROOT, 'build', 'current-trainers-install-report.json');
+      fs.mkdirSync(path.dirname(reportFile), { recursive: true });
+      fs.writeFileSync(reportFile, JSON.stringify({ results }, null, 2), 'utf8');
+      const failed = results.some((result) => !result.ok);
+      logLine('[install-current-trainers] 完成', `${results.length - results.filter((result) => !result.ok).length}/${results.length}`);
+      app.exit(failed ? 1 : 0);
+    });
+  }
+
   // 自检：--smoke 启动后截图并退出（开发调试用）
   // 压力自检：--soak 反复翻页 + 滚到底，观察是否崩溃/内存暴涨
   if (process.argv.includes('--soak')) {
@@ -238,6 +338,11 @@ function createWindow() {
       const wait = (ms) => new Promise((r) => setTimeout(r, ms));
       const results = [];
       const checks = [];
+      const totalCount = JSON.parse(fs.readFileSync(dataFile(), 'utf8')).trainers.length;
+      const pageCountExpected = Math.max(1, Math.ceil(totalCount / 72));
+      const lastPageCards = totalCount - (pageCountExpected - 1) * 72;
+      const totalLabel = `全部修改器 · 共 ${totalCount} 个`;
+      const lastPageHint = `第 ${pageCountExpected} / ${pageCountExpected} 页`;
 
       // 读状态片段（page/pageCount 直接读渲染层内部状态，分页条隐藏时也能拿到）
       const S = [
@@ -294,20 +399,20 @@ function createWindow() {
 
       // ---------- 1. 基础与页码窗口 ----------
       await act('复位：全部 Tab + 清空搜索 + 第 1 页', 'document.querySelector(\'#tabs .tab[data-tab="all"]\').click(); const el=document.querySelector(\'#search\'); if(el.value){el.value=\'\';el.dispatchEvent(new Event(\'input\',{bubbles:true}));} return {ok:1};', 700);
-      await obs('① 首页', { cards: 72, page: 1, domPage: 1, pageCount: 11, pagerHidden: false, seq: [1, 2, 3, 4, 5, 11], ellipsis: 1, emptyShown: false, count: '全部修改器 · 共 757 个', hint: '第 1 / 11 页' });
+      await obs('① 首页', { cards: 72, page: 1, domPage: 1, pageCount: pageCountExpected, pagerHidden: false, seq: [1, 2, 3, 4, 5, pageCountExpected], ellipsis: 1, emptyShown: false, count: totalLabel, hint: `第 1 / ${pageCountExpected} 页` });
 
       await jumpTo(6);
       await obs('② 第 6 页 —— 页码窗口居中，两侧省略号', { cards: 72, page: 6, pageCount: 11, seq: [1, 4, 5, 6, 7, 8, 11], ellipsis: 2, hint: '第 6 / 11 页' });
 
-      await jumpTo(11);
-      await obs('③ 末页 —— 卡片数与页码窗口贴右', { cards: 37, page: 11, seq: [1, 7, 8, 9, 10, 11], ellipsis: 1, hint: '第 11 / 11 页', jumpValue: '11' });
+      await jumpTo(pageCountExpected);
+      await obs('③ 末页 —— 卡片数与页码窗口贴右', { cards: lastPageCards, page: pageCountExpected, seq: [1, 7, 8, 9, 10, pageCountExpected], ellipsis: 1, hint: lastPageHint, jumpValue: String(pageCountExpected) });
       await obs('④ 末页「下一页」应禁用', null);
       const lastBtn = await run("const b=[...document.querySelectorAll('#pager button')].find(x=>x.textContent.indexOf('下一页')>=0); const p=[...document.querySelectorAll('#pager button')].find(x=>x.textContent.indexOf('上一页')>=0); return {nextDisabled:b.disabled, prevDisabled:p.disabled};");
       checks.push({ name: '④ 末页「下一页」应禁用 / 「上一页」可用', ok: lastBtn.nextDisabled === true && lastBtn.prevDisabled === false, got: lastBtn });
 
       // ---------- 2. 越界 clamp ----------
       await callGlobal('gotoPage(9999)');
-      await obs('⑤ gotoPage(9999) 应夹到末页', { page: 11, cards: 37 });
+      await obs('⑤ gotoPage(9999) 应夹到末页', { page: pageCountExpected, cards: lastPageCards });
       await callGlobal('gotoPage(-5)');
       await obs('⑥ gotoPage(-5) 应夹到第 1 页', { page: 1, cards: 72 });
       await callGlobal('gotoPage(NaN)');
@@ -315,7 +420,7 @@ function createWindow() {
 
       // ---------- 3. 跳转框边界 ----------
       await jumpTo(99);
-      await obs('⑧ 跳转框输入 99（越上界）应夹到末页', { page: 11, cards: 37, jumpValue: '11' });
+      await obs('⑧ 跳转框输入 99（越上界）应夹到末页', { page: pageCountExpected, cards: lastPageCards, jumpValue: String(pageCountExpected) });
       await jumpTo(0);
       await obs('⑨ 跳转框输入 0（越下界）应回到第 1 页', { page: 1, cards: 72, jumpValue: '1' });
       await jumpTo('abc');
@@ -348,7 +453,7 @@ function createWindow() {
       await obs('⑰ 搜不到 —— 空态', { page: 1, pageCount: 1, cards: 0, emptyShown: true, pagerHidden: true });
 
       await clearSearch();
-      await obs('⑱ 清空搜索后恢复全量第 1 页', { page: 1, pageCount: 11, cards: 72, pagerHidden: false, count: '全部修改器 · 共 757 个' });
+      await obs('⑱ 清空搜索后恢复全量第 1 页', { page: 1, pageCount: pageCountExpected, cards: 72, pagerHidden: false, count: totalLabel });
 
       // ---------- 7. 收藏 Tab：空态 / 收藏 / 取消 ----------
       await tabClick('fav');
@@ -372,7 +477,7 @@ function createWindow() {
       checks.push({ name: '㉓ 5 次点击应全部生效（无吞点击）', ok: r1.clicked === 5, got: r1 });
 
       const r2 = await nextN(50);
-      await obs('㉔ 继续连点 50 次应停在末页', { page: 11, cards: 37 });
+      await obs('㉔ 继续连点 50 次应停在末页', { page: pageCountExpected, cards: lastPageCards });
       checks.push({ name: '㉔ 连点 50 次只应生效 5 次（6→11）', ok: r2.clicked === 5, got: r2 });
 
       // ---------- 9. 删除后页码 clamp（el = 73 条 / 2 页 / 末页仅 1 条）----------
@@ -391,7 +496,7 @@ function createWindow() {
       await obs('㉘ 删除后剩 72 条 —— 页码应从第 2 页 clamp 回第 1 页', { page: 1, pageCount: 1, cards: 72, pagerHidden: true, count: '全部修改器 · 共 72 个' });
 
       await clearSearch();
-      await obs('㉙ 清空搜索 —— 总量应少 1 条', { page: 1, pageCount: 11, cards: 72, count: '全部修改器 · 共 756 个' });
+      await obs('㉙ 清空搜索 —— 总量应少 1 条', { page: 1, pageCount: pageCountExpected, cards: 72, count: `全部修改器 · 共 ${totalCount - 1} 个` });
 
       // ---------- 10. 窗口尺寸变化 ----------
       mainWindow.setBounds({ width: 720, height: 640 });
@@ -551,6 +656,12 @@ app.whenReady().then(() => {
   nativeTheme.themeSource = 'dark';
   ensureDataFile();
   readState();
+  if (process.argv.includes('--trainer-smoke')) {
+    const testState = readState();
+    testState.settings.downloadDir = path.join(ROOT, 'build', 'trainer-smoke-downloads');
+    persistState();
+  }
+  trainerLaunchGuard = createTrainerLaunchGuard(readState().activeTrainers, isProcessAlive);
   // macOS 保留最小菜单，确保 ⌘C/⌘V/⌘Q 等快捷键可用；其他平台隐藏菜单栏
   if (process.platform === 'darwin') {
     Menu.setApplicationMenu(
@@ -640,7 +751,60 @@ ipcMain.handle('data:refresh', async (_e, { force = false } = {}) => runRefresh(
 /* IPC：状态（收藏 / 下载 / 最近 / 隐藏 / 设置）                          */
 /* ------------------------------------------------------------------ */
 
-ipcMain.handle('state:get', async () => ({ ok: true, state: readState() }));
+async function runPowerShellScript(name, args = []) {
+  return new Promise((resolve, reject) => {
+    const script = path.join(scriptsDir(), name);
+    const child = spawn('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, ...args,
+    ], { windowsHide: false, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => { stdout = (stdout + chunk.toString()).slice(-100_000); });
+    child.stderr.on('data', (chunk) => { stderr = (stderr + chunk.toString()).slice(-4000); });
+    child.once('error', reject);
+    child.once('close', (code) => resolve({ code, stdout: stdout.trim(), stderr: stderr.trim() }));
+  });
+}
+
+async function refreshActiveTrainers() {
+  if (process.platform !== 'win32' || !trainerLaunchGuard) return;
+  try {
+    const result = await runPowerShellScript('list-running-trainers.ps1');
+    if (result.code !== 0) return;
+    let windows = JSON.parse(result.stdout || '[]');
+    if (!Array.isArray(windows)) windows = [windows];
+    const trainers = JSON.parse(await fsp.readFile(dataFile(), 'utf8')).trainers || [];
+    const prior = trainerLaunchGuard.snapshot();
+
+    for (const trainer of trainers) {
+      const slug = trainer.url.replace(/\/$/, '').split('/').pop();
+      const window = windows.find((item) => item.title && trainer.cn && item.title.includes(trainer.cn));
+      if (window) {
+        trainerLaunchGuard.started(slug, {
+          pid: Number(window.pid),
+          file: prior[slug]?.file || '',
+          name: trainer.cn || trainer.en,
+          title: window.title,
+          at: prior[slug]?.at || new Date().toISOString(),
+        });
+      }
+    }
+
+    const s = readState();
+    const active = trainerLaunchGuard.snapshot();
+    if (JSON.stringify(s.activeTrainers || {}) !== JSON.stringify(active)) {
+      s.activeTrainers = active;
+      writeState();
+    }
+  } catch (error) {
+    logLine('[trainer-state] 刷新运行状态失败：', String(error.message || error));
+  }
+}
+
+ipcMain.handle('state:get', async () => {
+  await refreshActiveTrainers();
+  return { ok: true, state: readState() };
+});
 
 ipcMain.handle('state:set', async (_e, patch = {}) => {
   const s = readState();
@@ -680,6 +844,7 @@ ipcMain.handle('download:start', async (_e, { slug, dlUrl, referer, fallbackName
 
   const send = (p) => mainWindow && mainWindow.webContents.send('download:progress', { slug, ...p });
   let target = null;
+  let downloadComplete = false;
 
   try {
     const dir = defaultDownloadDir();
@@ -733,22 +898,52 @@ ipcMain.handle('download:start', async (_e, { slug, dlUrl, referer, fallbackName
       send({ state: 'downloading', received, total, percent: pct, speed });
     });
     await pipeline(nodeStream, fssync.createWriteStream(target));
+    downloadComplete = true;
+
+    let fileKind = await detectFileKind(target);
+    if (fileKind === 'exe' && path.extname(target).toLowerCase() !== '.exe') {
+      const base = path.join(dir, path.basename(target, path.extname(target)));
+      let executableTarget = `${base}.exe`;
+      let suffix = 1;
+      while (fs.existsSync(executableTarget) && suffix < 500) executableTarget = `${base} (${suffix++}).exe`;
+      await fsp.rename(target, executableTarget);
+      target = executableTarget;
+    }
+
+    const extractedDir = `${target}.contents`;
+    let executable = null;
+    let extractionError = '';
+    if (fileKind === 'zip') {
+      const extraction = await extractZip(target, extractedDir);
+      if (extraction.ok) {
+        executable = await findTrainerBinary(extractedDir, [fallbackName, slug]);
+        if (!executable) extractionError = '压缩包已解压，但没有找到可识别的修改器程序';
+      } else {
+        extractionError = extraction.error;
+      }
+    } else if (fileKind === 'exe') {
+      executable = target;
+    }
 
     const stat = await fsp.stat(target);
     const s = readState();
     s.downloads[slug] = {
       file: target,
+      archive: target,
+      extractedDir: fs.existsSync(extractedDir) ? extractedDir : '',
+      executable: executable || '',
+      extractionError,
       name: path.basename(target),
       size: stat.size,
       at: new Date().toISOString(),
     };
+    s.favorites = [slug, ...s.favorites.filter((item) => item !== slug)];
     writeState();
-    send({ state: 'done', file: target, size: stat.size });
-    return { ok: true, file: target, size: stat.size, name: path.basename(target) };
+    send({ state: 'done', file: target, executable, extractionError, size: stat.size });
+    return { ok: true, file: target, executable, extractionError, size: stat.size, name: path.basename(target) };
   } catch (e) {
     const aborted = controller.signal.aborted;
-    // 取消时清理已写入的半截文件，避免下载目录堆满 xxx (1).zip 半成品
-    if (aborted && target) await fsp.rm(target, { force: true }).catch(() => {});
+    if (!downloadComplete && target) await fsp.rm(target, { force: true }).catch(() => {});
     send({ state: aborted ? 'canceled' : 'error', message: String(e.message || e) });
     return { ok: false, error: aborted ? '已取消' : String(e.message || e) };
   } finally {
@@ -768,6 +963,9 @@ ipcMain.handle('download:delete', async (_e, { slug }) => {
   if (!rec) return { ok: false, error: '没有下载记录' };
   try {
     if (rec.file && fs.existsSync(rec.file)) await fsp.rm(rec.file, { force: true });
+    if (rec.extractedDir && fs.existsSync(rec.extractedDir)) {
+      await fsp.rm(rec.extractedDir, { recursive: true, force: true });
+    }
   } catch (e) {
     return { ok: false, error: String(e.message || e) };
   }
@@ -780,83 +978,120 @@ ipcMain.handle('download:delete', async (_e, { slug }) => {
 /* IPC：运行本地修改器                                                   */
 /* ------------------------------------------------------------------ */
 
-/** 递归查找目录中与游戏名匹配的可执行文件 */
-async function findExecutable(dir, names) {
-  if (!dir || !fs.existsSync(dir)) return null;
-  const keys = names
-    .map((n) =>
-      String(n || '')
-        .toLowerCase()
-        .replace(/trainer|修改器/g, '')
-        .replace(/[^a-z0-9\u4e00-\u9fff]/g, ''),
-    )
-    .filter((k) => k.length >= 3);
-  if (!keys.length) return null;
-
-  const skipDir = new Set(['node_modules', '.git', '$RECYCLE.BIN', 'System Volume Information']);
-  const exts =
-    process.platform === 'win32'
-      ? ['.exe', '.bat', '.cmd']
-      : process.platform === 'darwin'
-        ? ['.app', '.exe', '.command', '.sh']
-        : ['.exe', '.sh', '.appimage', '.AppImage'];
-
-  const queue = [{ d: dir, depth: 0 }];
-  while (queue.length) {
-    const { d, depth } = queue.shift();
-    let entries = [];
-    try {
-      entries = await fsp.readdir(d, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const ent of entries) {
-      const full = path.join(d, ent.name);
-      if (ent.isDirectory()) {
-        if (depth < 3 && !skipDir.has(ent.name)) queue.push({ d: full, depth: depth + 1 });
-        if (exts.includes(path.extname(ent.name).toLowerCase())) {
-          const k = ent.name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]/g, '');
-          if (keys.some((key) => k.includes(key) || key.includes(k))) return full;
-        }
-      } else {
-        const ext = path.extname(ent.name).toLowerCase();
-        if (!exts.includes(ext)) continue;
-        const k = ent.name.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]/g, '');
-        if (keys.some((key) => k.includes(key) || key.includes(k))) return full;
-      }
-    }
+function isProcessAlive(pid) {
+  const value = Number(pid);
+  if (!Number.isInteger(value) || value <= 0) return false;
+  try {
+    process.kill(value, 0);
+    return true;
+  } catch (error) {
+    return error.code === 'EPERM';
   }
-  return null;
 }
 
-function launchFile(file) {
+function persistActiveTrainers() {
+  const s = readState();
+  s.activeTrainers = trainerLaunchGuard.snapshot();
+  writeState();
+}
+
+function launchWindowsTrainer(file, titleMarker) {
   return new Promise((resolve) => {
+    const script = path.join(scriptsDir(), 'launch-trainer.ps1');
+    let stdout = '';
+    let stderr = '';
     let settled = false;
-    const done = (r) => { if (!settled) { settled = true; resolve(r); } };
+    const done = (result) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+
     try {
-      let child;
-      if (process.platform === 'win32') {
-        child = spawn(file, [], { detached: true, stdio: 'ignore', cwd: path.dirname(file) });
-      } else if (process.platform === 'darwin') {
-        // .app 用 open -a；.exe 交给系统关联程序（如已安装 Wine）
-        child = file.toLowerCase().endsWith('.app')
-          ? spawn('open', ['-a', file], { detached: true, stdio: 'ignore' })
-          : spawn('open', [file], { detached: true, stdio: 'ignore' });
-      } else {
-        child = spawn('xdg-open', [file], { detached: true, stdio: 'ignore' });
-      }
-      child.on('error', (err) => done({ ok: false, error: String(err.message || err) }));
-      // open/xdg-open 对「文件不存在/无法打开」会返回非 0 退出码，但 error 事件不触发，
-      // 必须靠 exit 判断，否则会误报「已启动」
-      child.on('exit', (code) => {
-        if (code !== 0) done({ ok: false, error: `启动失败（退出码 ${code}）` });
+      const child = spawn('powershell.exe', [
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', script, file, titleMarker || path.basename(file, path.extname(file)),
+      ], { windowsHide: false, stdio: ['ignore', 'pipe', 'pipe'] });
+      child.stdout.on('data', (chunk) => { stdout = (stdout + chunk.toString()).slice(-4000); });
+      child.stderr.on('data', (chunk) => { stderr = (stderr + chunk.toString()).slice(-4000); });
+      child.once('error', (error) => done({ ok: false, error: String(error.message || error) }));
+      child.once('close', async (code) => {
+        const line = stdout.trim().split(/\r?\n/).pop() || '';
+        const existing = /^ALREADY_RUNNING:(\d+):(.*)$/.exec(line);
+        if (existing) {
+          done({ ok: false, alreadyRunning: true, activeTrainer: { pid: Number(existing[1]), title: existing[2] } });
+          return;
+        }
+        const started = /^STARTED:(\d+)$/.exec(line);
+        if (code !== 0 || !started) {
+          done({ ok: false, error: stderr.trim() || 'Windows 未能启动修改器' });
+          return;
+        }
+        const pid = Number(started[1]);
+        await new Promise((r) => setTimeout(r, 1500));
+        done(isProcessAlive(pid)
+          ? { ok: true, pid }
+          : { ok: false, error: '修改器启动后立即退出' });
       });
-      child.unref();
-      setTimeout(() => done({ ok: true }), 600);
-    } catch (e) {
-      done({ ok: false, error: String(e.message || e) });
+    } catch (error) {
+      done({ ok: false, error: String(error.message || error) });
     }
   });
+}
+
+function launchFile(file, titleMarker) {
+  if (process.platform === 'win32') return launchWindowsTrainer(file, titleMarker);
+  return new Promise((resolve) => {
+    try {
+      const child = process.platform === 'darwin'
+        ? file.toLowerCase().endsWith('.app')
+          ? spawn('open', ['-a', file], { detached: true, stdio: 'ignore' })
+          : spawn('open', [file], { detached: true, stdio: 'ignore' })
+        : spawn('xdg-open', [file], { detached: true, stdio: 'ignore' });
+      child.once('error', (error) => resolve({ ok: false, error: String(error.message || error) }));
+      child.once('exit', (code) => {
+        if (code !== 0) resolve({ ok: false, error: `启动失败（退出码 ${code}）` });
+      });
+      child.unref();
+      setTimeout(() => resolve({ ok: true, pid: child.pid }), 1200);
+    } catch (error) {
+      resolve({ ok: false, error: String(error.message || error) });
+    }
+  });
+}
+
+async function startTrainer(slug, cn, en, file) {
+  const claim = trainerLaunchGuard.claim(slug);
+  if (!claim.ok) {
+    return {
+      ok: false,
+      alreadyRunning: !claim.pending,
+      launching: Boolean(claim.pending),
+      activeTrainer: claim.record || null,
+    };
+  }
+
+  try {
+    const result = await launchFile(file, cn || en);
+    if (result.ok && result.pid) {
+      trainerLaunchGuard.started(slug, {
+        pid: result.pid,
+        file,
+        name: cn || en,
+        at: new Date().toISOString(),
+      });
+      persistActiveTrainers();
+      const s = readState();
+      s.recent = [slug, ...s.recent.filter((item) => item !== slug)].slice(0, 60);
+      writeState();
+    } else {
+      trainerLaunchGuard.release(slug);
+    }
+    return { ...result, file };
+  } catch (error) {
+    trainerLaunchGuard.release(slug);
+    return { ok: false, error: String(error.message || error), file };
+  }
 }
 
 ipcMain.handle('launch:trainer', async (_e, { slug, cn, en }) => {
@@ -865,7 +1100,18 @@ ipcMain.handle('launch:trainer', async (_e, { slug, cn, en }) => {
 
   const candidates = [];
   const dl = s.downloads[slug];
+  if (dl?.executable && fs.existsSync(dl.executable)) {
+    return startTrainer(slug, cn, en, dl.executable);
+  }
   if (dl?.file && fs.existsSync(dl.file)) candidates.push(dl.file);
+  if (candidates.length && path.extname(candidates[0]).toLowerCase() === '.zip') {
+    return {
+      ok: false,
+      needsExtraction: true,
+      archive: candidates[0],
+      error: dl.extractionError || '压缩包中没有找到可直接启动的修改器，请先解压后再选择程序。',
+    };
+  }
 
   let file = null;
   if (!dir) {
@@ -883,12 +1129,7 @@ ipcMain.handle('launch:trainer', async (_e, { slug, cn, en }) => {
     };
   }
 
-  const r = await launchFile(file);
-  if (r.ok) {
-    s.recent = [slug, ...s.recent.filter((x) => x !== slug)].slice(0, 60);
-    writeState();
-  }
-  return { ...r, file };
+  return startTrainer(slug, cn, en, file);
 });
 
 /** 让用户手动指定要启动的文件 */
@@ -898,13 +1139,29 @@ ipcMain.handle('launch:pickFile', async (_e, { slug, cn, en }) => {
     properties: ['openFile'],
   });
   if (canceled || !filePaths.length) return { ok: false, error: '已取消' };
-  const r = await launchFile(filePaths[0]);
-  if (r.ok) {
-    const s = readState();
-    s.recent = [slug, ...s.recent.filter((x) => x !== slug)].slice(0, 60);
-    writeState();
+  return startTrainer(slug, cn, en, filePaths[0]);
+});
+
+ipcMain.handle('launch:stop', async (_e, { slug }) => {
+  await refreshActiveTrainers();
+  const active = trainerLaunchGuard.snapshot()[slug];
+  if (!active) return { ok: false, notRunning: true };
+
+  try {
+    if (process.platform === 'win32') {
+      const result = await runPowerShellScript('stop-trainer.ps1', [String(active.pid), active.name || slug]);
+      if (result.code !== 0 || result.stdout !== 'STOPPED') {
+        return { ok: false, error: result.stderr || '关闭修改器失败' };
+      }
+    } else {
+      process.kill(Number(active.pid), 'SIGTERM');
+    }
+    trainerLaunchGuard.forget(slug);
+    persistActiveTrainers();
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error.message || error) };
   }
-  return { ...r, file: filePaths[0] };
 });
 
 /* ------------------------------------------------------------------ */

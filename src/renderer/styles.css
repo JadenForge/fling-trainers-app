@@ -152,6 +152,7 @@ main { flex: 1 1 auto; overflow-y: auto; padding: 16px 20px 28px; }
   backdrop-filter: blur(4px);
 }
 .cover .badge-corner.ok { background: rgba(46, 204, 113, .9); }
+.cover .badge-corner.started { background: rgba(46, 204, 113, .96); }
 .cover .badge-corner.fav { top: 8px; right: auto; left: 8px; background: rgba(245, 165, 36, .92); }
 .cover .ov {
   position: absolute; inset: 0; display: grid; place-items: center; z-index: 2;
@@ -175,6 +176,8 @@ main { flex: 1 1 auto; overflow-y: auto; padding: 16px 20px 28px; }
 .act svg { width: 14px; height: 14px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .act.run { color: #cfd6e4; }
 .act.run:hover { color: var(--green); }
+.act.stop { color: var(--red); }
+.act.stop:hover { color: #ff7777; }
 .act.dl:hover { color: var(--accent); }
 .act.fav.on { color: var(--amber); }
 .act.fav.on svg { fill: var(--amber); }

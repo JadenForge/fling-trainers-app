@@ -28,7 +28,7 @@ const ICON = {
 
 let DATA = { meta: {}, trainers: [] };
 let APPINFO = null;
-let ST = { favorites: [], downloads: {}, recent: [], hidden: [], settings: {} };
+let ST = { favorites: [], downloads: {}, activeTrainers: {}, recent: [], hidden: [], settings: {} };
 let ui = { tab: 'all', q: '', sort: 'updated' };
 let list = [];      // 当前筛选排序后的列表
 let page = 1;       // 当前页码（从 1 开始）
@@ -366,6 +366,7 @@ function renderPager() {
 function cardEl(t) {
   const slug = slugOf(t);
   const dl = ST.downloads[slug];
+  const active = ST.activeTrainers?.[slug];
   const fav = ST.favorites.includes(slug);
 
   const card = document.createElement('div');
@@ -386,7 +387,8 @@ function cardEl(t) {
   ph.textContent = (t.cn || t.en || '?').slice(0, 1);
   cover.appendChild(ph);
   if (fav) { const b = document.createElement('span'); b.className = 'badge-corner fav'; b.textContent = '已收藏'; cover.appendChild(b); }
-  if (dl) { const b = document.createElement('span'); b.className = 'badge-corner ok'; b.textContent = '已下载'; cover.appendChild(b); }
+  if (active) { const b = document.createElement('span'); b.className = 'badge-corner started'; b.textContent = '已启动'; cover.appendChild(b); }
+  else if (dl) { const b = document.createElement('span'); b.className = 'badge-corner ok'; b.textContent = '已下载'; cover.appendChild(b); }
 
   const ov = document.createElement('div');
   ov.className = 'ov';
@@ -410,6 +412,7 @@ function cardEl(t) {
   const parts = [];
   if (t.options) parts.push(`${t.options} 项`);
   if (t.lastUpdated) parts.push(`更新 ${t.lastUpdated}`);
+  if (active) parts.push('已启动');
   meta.textContent = parts.join(' · ') || '—';
   card.appendChild(meta);
 
@@ -417,9 +420,10 @@ function cardEl(t) {
   acts.className = 'actions';
 
   const primary = document.createElement('button');
-  primary.className = 'act ' + (dl ? 'run' : 'dl');
-  primary.innerHTML = (dl ? ICON.play : ICON.down) + `<span>${dl ? '运行' : '下载'}</span>`;
-  primary.onclick = (e) => { e.stopPropagation(); dl ? doRun(t) : doDownload(t); };
+  primary.className = 'act ' + (active ? 'stop' : dl ? 'run' : 'dl');
+  primary.title = active ? '关闭修改器' : dl ? '运行修改器' : '下载修改器';
+  primary.innerHTML = (active ? ICON.stop : dl ? ICON.play : ICON.down) + `<span>${active ? '关闭' : dl ? '运行' : '下载'}</span>`;
+  primary.onclick = (e) => { e.stopPropagation(); active ? doStop(t) : dl ? doRun(t) : doDownload(t); };
   acts.appendChild(primary);
 
   const favBtn = document.createElement('button');
@@ -500,16 +504,47 @@ async function doDownload(t, dlUrl) {
   if (!r.ok && r.error !== '已取消') toast('下载失败：' + r.error, 'err');
 }
 
+async function doStop(t) {
+  const r = await window.api.stopTrainer({ slug: slugOf(t) });
+  if (!r.ok) {
+    if (r.notRunning) await refreshStateAndView();
+    else toast('关闭修改器失败：' + (r.error || ''), 'err');
+    return;
+  }
+  await refreshStateAndView();
+  toast(`已关闭《${t.cn}》修改器`);
+}
+
 async function doRun(t) {
   const slug = slugOf(t);
   if (ST.downloads[slug]) status(`正在启动《${t.cn}》…`);
   const r = await window.api.launch({ slug, cn: t.cn, en: t.en });
 
+  if (r.alreadyRunning) {
+    await refreshStateAndView();
+    toast(`《${t.cn}》修改器已经在运行，只能保留一个实例。`);
+    return;
+  }
+  if (r.launching) {
+    toast(`《${t.cn}》修改器正在启动，请稍候。`);
+    return;
+  }
+  if (r.pending) {
+    status('等待系统启动确认', '');
+    toast('已请求系统启动，请确认弹出的系统提示。');
+    return;
+  }
   if (r.ok) {
     toast(`已启动《${t.cn}》`, 'ok');
     status('就绪', '');
     ST.recent = [slug, ...ST.recent.filter((x) => x !== slug)].slice(0, 60);
+    await refreshStateAndView();
     if (ui.tab === 'recent' || ui.sort === 'recent') applyFilter(true);
+    return;
+  }
+  if (r.needsExtraction) {
+    if (r.archive) window.api.showItem({ file: r.archive });
+    toast(`${r.error} 已打开压缩包所在位置。`, 'err');
     return;
   }
   if (r.needDir) {
@@ -534,6 +569,7 @@ async function doRun(t) {
 function openDrawer(t) {
   const slug = slugOf(t);
   const dl = ST.downloads[slug];
+  const active = ST.activeTrainers?.[slug];
   const files = t.downloads || [];
 
   $('#dTitle').textContent = t.cn || t.en;
@@ -556,7 +592,7 @@ function openDrawer(t) {
     ['支持版本', t.gameVersion || '—'],
     ['最后更新', t.lastUpdated || '—'],
     ['发布时间', fmtDate(t.published)],
-    ['本地状态', dl ? `已下载 · ${dl.name}` : '未下载'],
+    ['本地状态', [active ? '已启动' : '', dl ? `已下载 · ${dl.name}` : ''].filter(Boolean).join(' · ') || '未下载'],
   ];
   for (const [k, v] of rows) {
     const dt = document.createElement('dt'); dt.textContent = k;
@@ -572,7 +608,7 @@ function openDrawer(t) {
     b.className = 'btn ' + cls; b.textContent = label; b.onclick = fn;
     return b;
   };
-  acts.appendChild(mk(dl ? '运行' : '下载', '', () => (dl ? doRun(t) : doDownload(t))));
+  acts.appendChild(mk(active ? '关闭' : dl ? '运行' : '下载', active ? 'danger' : '', () => (active ? doStop(t) : dl ? doRun(t) : doDownload(t))));
   acts.appendChild(mk(ST.favorites.includes(slug) ? '取消收藏' : '收藏', 'ghost', () => doFav(t)));
   if (dl) acts.appendChild(mk('打开所在目录', 'ghost', () => window.api.showItem({ file: dl.file })));
   acts.appendChild(mk('访问官网页面', 'ghost', () => window.api.openExternal({ url: t.url })));
@@ -625,7 +661,10 @@ function switchTab(tab) {
   $$('#tabs .tab').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
   $('#viewMain').hidden = tab === 'settings';
   $('#viewSettings').hidden = tab !== 'settings';
-  if (tab !== 'settings') applyFilter();
+  if (tab !== 'settings') {
+    applyFilter();
+    refreshStateAndView();
+  }
   else renderSettingsStatic();
   $('#viewMain').scrollTop = 0;
 }
@@ -701,7 +740,12 @@ function bindEvents() {
       status(`下载中… ${fmtSize(p.received)}${p.total ? ' / ' + fmtSize(p.total) : ''} · ${fmtSize(p.speed)}/s`, p.total ? pct.toFixed(0) + '%' : '');
     } else if (p.state === 'done') {
       setProgress(null); status('就绪', '');
-      toast('下载完成：' + (p.file || '').split(/[/\\]/).pop(), 'ok');
+      if (p.executable) {
+        toast('下载并解压完成，现可点击「运行」', 'ok');
+      } else {
+        toast(`下载完成，但未能自动解压：${p.extractionError || '未识别到修改器程序'}`, 'err');
+        if (p.file) window.api.showItem({ file: p.file });
+      }
       refreshStateAndView();
     } else if (p.state === 'error') {
       setProgress(null); status('就绪', ''); toast('下载失败：' + p.message, 'err');
